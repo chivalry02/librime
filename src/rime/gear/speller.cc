@@ -98,36 +98,51 @@ Speller::Speller(const Ticket& ticket)
 }
 
 ProcessResult Speller::ProcessKeyEvent(const KeyEvent& key_event) {
+  // Speller 作为 Processor 的一个实现，只接管“拼写相关按键”。
+  // 返回值语义：
+  // - kAccepted: 当前 Processor 已消费按键，后续 Processor 不再处理该键。
+  // - kNoop: 当前 Processor 放行，让管线中的其他 Processor 继续尝试处理。
   if (key_event.release() || key_event.ctrl() || key_event.alt() ||
       key_event.super())
     return kNoop;
   int ch = key_event.keycode();
+  // 仅处理可打印 ASCII；功能键、控制字符等交由其他 Processor 处理。
   if (ch < 0x20 || ch >= 0x7f)  // not a valid key for spelling
     return kNoop;
+  // 空格是否作为拼写输入由 schema 配置 speller/use_space 控制。
+  // Shift+Space 常作为模式切换快捷键，因此这里不接管。
   if (ch == XK_space && (!use_space_ || key_event.shift()))
     return kNoop;
+  // 只允许 alphabet 或 delimiter 集合中的字符进入拼写流程。
   if (!belongs_to(ch, alphabet_) && !belongs_to(ch, delimiters_))
     return kNoop;
   Context* ctx = engine_->context();
+  // 结合 initials/finals 与当前 caret 位置，判断本次输入是否为“声母位输入”。
+  // 若当前位置期待声母，但当前字符不是声母，则放行给其他 Processor。
   bool is_initial = belongs_to(ch, initials_);
   if (!is_initial && expecting_an_initial(ctx, alphabet_, finals_)) {
     return kNoop;
   }
-  // handles input beyond max_code_length when auto_select is false.
+  // 先在“写入新字符前”处理上一轮状态：
+  // 1) 声母输入时，若已达到 max_code_length，尝试自动上屏；
+  // 2) 若配置为 manual/max_length 且当前无候选，按策略自动清空。
+  // 这样可以避免在超长输入场景下累积无效编码。
   if (is_initial && AutoSelectAtMaxCodeLength(ctx)) {
     DLOG(INFO) << "auto-select at max code length.";
   } else if ((auto_clear_ == kClearMaxLength || auto_clear_ == kClearManual) &&
              AutoClear(ctx)) {
     DLOG(INFO) << "auto-clear at max code when no candidate.";
   }
-  // make a backup of previous conversion before modifying input
+  // 在改写 input 前备份当前 segment：用于“新输入失败时回退并复用旧匹配”。
   Segment previous_segment;
   if (auto_select_ && ctx->HasMenu()) {
     previous_segment = ctx->composition().back();
   }
   DLOG(INFO) << "add to input: '" << (char)ch << "', " << key_event.repr();
+  // 真正写入输入串，并触发一次重新分段/翻译流程。
   ctx->PushInput(ch);
   ctx->BeginEditing();
+  // 当前新输入如果导致无候选，尝试把上一次可确认的匹配先提交（或拆分提交）。
   if (AutoSelectPreviousMatch(ctx, &previous_segment)) {
     DLOG(INFO) << "auto-select previous match.";
     // after auto-selecting, if only the current non-initial key is left,
@@ -137,11 +152,14 @@ ProcessResult Speller::ProcessKeyEvent(const KeyEvent& key_event) {
       return kNoop;
     }
   }
+  // “写入后”再判断是否唯一候选可自动上屏。
+  // 若仍无候选且 auto_clear=auto，则自动清空，避免用户停留在无效拼写态。
   if (AutoSelectUniqueCandidate(ctx)) {
     DLOG(INFO) << "auto-select unique candidate.";
   } else if (auto_clear_ == kClearAuto && AutoClear(ctx)) {
     DLOG(INFO) << "auto-clear when no candidate.";
   }
+  // 到这里说明 Speller 已正式接管并消费了本次按键。
   return kAccepted;
 }
 
